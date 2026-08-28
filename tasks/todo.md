@@ -39,6 +39,10 @@ The previous persistent copy is retained at
 
 ## Live performance fix
 
-- [ ] Inspect the hung interactive matcher on the Unraid host and confirm the bottleneck.
-- [ ] Replace the unbounded matcher with a bounded, deterministic approach.
-- [ ] Test the fix offline and on the Unraid host without changing Plex data.
+- [x] Inspect the hung interactive matcher on the Unraid host and confirm the bottleneck.
+- [x] Replace the unbounded matcher with a bounded, deterministic approach.
+- [x] Test the fix offline and on the Unraid host without changing Plex data.
+
+Confirmed the full candidate list on the Unraid host. The live `bogus` interactive
+read-only path completed and cancelled normally in 4 seconds (including the
+candidate query), with exit status 0.
