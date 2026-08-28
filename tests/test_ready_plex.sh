@@ -3,8 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../plex-ready
-source "$SCRIPT_DIRECTORY/../plex-ready"
+# shellcheck source=../ready-plex
+source "$SCRIPT_DIRECTORY/../ready-plex"
 
 failures=0
 temporary_directory="$(mktemp -d)"
@@ -41,4 +41,4 @@ assert_status 1 "$status" 'non-200 response is not ready'
 if ((failures > 0)); then
     exit 1
 fi
-printf 'All plex-ready tests passed.\n'
+printf 'All ready-plex tests passed.\n'

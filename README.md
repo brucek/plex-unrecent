@@ -118,13 +118,13 @@ If the item still appears in Plex Desktop's Recently Added row, fully quit the P
 
 ## Check Plex readiness
 
-`plex-ready` is a companion command that waits for Plex to become usable after
+`ready-plex` is a companion command that waits for Plex to become usable after
 a restart or any other maintenance:
 
 ```bash
-plex-ready
-plex-ready --timeout 120
-PLEX_READY_CONTAINER=plex plex-ready --interval 3
+ready-plex
+ready-plex --timeout 120
+PLEX_READY_CONTAINER=plex ready-plex --interval 3
 ```
 
 It checks that the configured Docker container is running and calls
@@ -138,8 +138,8 @@ ready**. The command exits `0` when Plex is ready, `1` after its timeout, and
 Install it using the same persistent-Unraid pattern as `plex-unrecent`:
 
 ```bash
-cp plex-ready /boot/config/custom/bin/plex-ready
-chmod 755 /boot/config/custom/bin/plex-ready
+cp ready-plex /boot/config/custom/bin/ready-plex
+chmod 755 /boot/config/custom/bin/ready-plex
 ```
 
 ## Troubleshooting
@@ -179,7 +179,7 @@ The offline harness uses mocked database reads and a temporary directory; it nev
 ```bash
 bash -n plex-unrecent
 bash tests/test_plex_unrecent.sh
-./plex-ready --help
-bash tests/test_plex_ready.sh
+./ready-plex --help
+bash tests/test_ready_plex.sh
 shellcheck plex-unrecent   # when installed
 ```

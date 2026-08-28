@@ -49,6 +49,7 @@ candidate query), with exit status 0.
 
 ## Plex readiness checker
 
+- [x] Rename the command to `ready-plex` for convenient tab completion.
 - [ ] Add a standalone readiness checker with clear status and exit codes.
 - [ ] Add offline response-classification tests and usage documentation.
 - [ ] Test and install the checker on the Unraid host's persistent and active paths.

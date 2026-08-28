@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# plex-ready - wait for Plex's local identity endpoint to report ready.
+# ready-plex - wait for Plex's local identity endpoint to report ready.
 
 set -euo pipefail
 
@@ -15,7 +15,7 @@ RESPONSE_FILE=""
 
 usage() {
     cat <<'EOF'
-Usage: plex-ready [--timeout SECONDS] [--interval SECONDS]
+Usage: ready-plex [--timeout SECONDS] [--interval SECONDS]
 
 Wait for the local Plex identity endpoint to return a healthy MediaContainer.
 
