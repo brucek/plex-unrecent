@@ -1,0 +1,684 @@
+#!/usr/bin/env bash
+# plex-unrecent - safely backdate selected Plex items out of Recently Added.
+
+set -euo pipefail
+
+readonly DEFAULT_CONTAINER="plex"
+readonly SQLITE_PATH="/usr/lib/plexmediaserver/Plex SQLite"
+readonly CONTAINER_DB_PATH="/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+readonly DB_RELATIVE_PATH="Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+readonly FIELD_SEPARATOR=$'\x1f'
+readonly READ_TIMEOUT_SECONDS=20
+readonly IDENTITY_URL="http://127.0.0.1:32400/identity"
+readonly IDENTITY_TIMEOUT_SECONDS=60
+readonly BACKDATE_SQL="strftime('%s','2000-01-01 00:00:00')"
+
+PLEX_CONTAINER="${PLEX_UNRECENT_CONTAINER:-$DEFAULT_CONTAINER}"
+BACKUP_RETENTION="${PLEX_UNRECENT_BACKUPS:-5}"
+CONFIG_SOURCE=""
+PLEX_IMAGE=""
+HOST_DB_PATH=""
+DB_DIRECTORY=""
+DB_FILENAME=""
+DB_OWNER=""
+PLEX_CONTAINER_ID=""
+PLEX_STOPPED=0
+RESTART_ATTEMPTED=0
+
+declare -a CANDIDATE_IDS=()
+declare -a CANDIDATE_TITLES=()
+declare -a CANDIDATE_YEARS=()
+declare -a CANDIDATE_TYPES=()
+declare -a CANDIDATE_LIBRARIES=()
+declare -a RANKED_MATCHES=()
+
+declare -a QUEUE_IDS=()
+declare -a QUEUE_TITLES=()
+declare -a QUEUE_YEARS=()
+declare -a QUEUE_TYPES=()
+declare -a QUEUE_LIBRARIES=()
+
+declare -a EXPANDED_IDS=()
+declare -A SERIES_SEASON_COUNTS=()
+declare -A SERIES_EPISODE_COUNTS=()
+
+usage() {
+    cat <<'EOF'
+Usage:
+  plex-unrecent "title"    Select one high-confidence movie or series
+  plex-unrecent            Interactively queue movies and series for one batch
+
+Environment:
+  PLEX_UNRECENT_CONTAINER  Plex container name (default: plex)
+  PLEX_UNRECENT_BACKUPS    Number of this utility's backups to retain (default: 5)
+EOF
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+warn() {
+    printf 'Warning: %s\n' "$*" >&2
+}
+
+item_kind() {
+    case "$1" in
+        1) printf 'Movie' ;;
+        2) printf 'Series' ;;
+        *) printf 'Unknown' ;;
+    esac
+}
+
+display_year() {
+    if [[ -n "$1" ]]; then
+        printf '%s' "$1"
+    else
+        printf 'unknown year'
+    fi
+}
+
+display_title() {
+    local title="$1"
+    local year="$2"
+    printf '%s (%s)' "$title" "$(display_year "$year")"
+}
+
+validate_configuration() {
+    [[ "$BACKUP_RETENTION" =~ ^[1-9][0-9]*$ ]] || die 'PLEX_UNRECENT_BACKUPS must be a positive integer.'
+    command -v docker >/dev/null 2>&1 || die 'docker is required on the Unraid host.'
+    command -v curl >/dev/null 2>&1 || die 'curl is required to verify Plex restart health.'
+
+    local running
+    running="$(docker inspect --format '{{.State.Running}}' "$PLEX_CONTAINER" 2>/dev/null)" \
+        || die "Cannot inspect Plex container '$PLEX_CONTAINER'."
+    [[ "$running" == 'true' ]] || die "Plex container '$PLEX_CONTAINER' is not running."
+    PLEX_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$PLEX_CONTAINER")"
+    [[ -n "$PLEX_CONTAINER_ID" ]] || die "Could not determine the ID for Plex container '$PLEX_CONTAINER'."
+
+    CONFIG_SOURCE="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{end}}{{end}}' "$PLEX_CONTAINER")"
+    [[ -n "$CONFIG_SOURCE" ]] || die "Could not find the /config mount for '$PLEX_CONTAINER'."
+    [[ -d "$CONFIG_SOURCE" ]] || die "The discovered /config source is not a host directory: $CONFIG_SOURCE"
+
+    PLEX_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$PLEX_CONTAINER")"
+    [[ -n "$PLEX_IMAGE" ]] || die "Could not determine the Plex image for '$PLEX_CONTAINER'."
+
+    HOST_DB_PATH="$CONFIG_SOURCE/$DB_RELATIVE_PATH"
+    [[ -f "$HOST_DB_PATH" ]] || die "Plex database not found at discovered host path: $HOST_DB_PATH"
+    DB_DIRECTORY="$(dirname "$HOST_DB_PATH")"
+    DB_FILENAME="$(basename "$HOST_DB_PATH")"
+    DB_OWNER="$(stat -c '%u:%g' "$HOST_DB_PATH" 2>/dev/null)" \
+        || die "Could not determine the Plex database owner: $HOST_DB_PATH"
+    [[ "$DB_OWNER" =~ ^[0-9]+:[0-9]+$ ]] || die "Plex database owner is invalid: $DB_OWNER"
+}
+
+readonly_query() {
+    local sql="$1"
+
+    # timeout is optional on Unraid; use it when present so a read lock cannot hang forever.
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$READ_TIMEOUT_SECONDS" docker exec "$PLEX_CONTAINER" "$SQLITE_PATH" \
+            -readonly -noheader -separator "$FIELD_SEPARATOR" "$CONTAINER_DB_PATH" "$sql"
+    else
+        docker exec "$PLEX_CONTAINER" "$SQLITE_PATH" \
+            -readonly -noheader -separator "$FIELD_SEPARATOR" "$CONTAINER_DB_PATH" "$sql"
+    fi
+}
+
+load_candidates() {
+    local sql rows id title year type library
+    sql="
+SELECT mi.id,
+       replace(replace(replace(mi.title, char(31), ' '), char(10), ' '), char(13), ' '),
+       COALESCE(mi.year, ''),
+       mi.metadata_type,
+       replace(replace(replace(COALESCE(ls.name, ''), char(31), ' '), char(10), ' '), char(13), ' ')
+  FROM metadata_items AS mi
+  LEFT JOIN library_sections AS ls ON ls.id = mi.library_section_id
+ WHERE mi.metadata_type IN (1, 2)
+   AND mi.title IS NOT NULL
+ ORDER BY mi.title COLLATE NOCASE, mi.id;"
+
+    if ! rows="$(readonly_query "$sql")"; then
+        die 'Could not read Plex titles. Plex remains running and no changes were made.'
+    fi
+
+    CANDIDATE_IDS=()
+    CANDIDATE_TITLES=()
+    CANDIDATE_YEARS=()
+    CANDIDATE_TYPES=()
+    CANDIDATE_LIBRARIES=()
+    while IFS="$FIELD_SEPARATOR" read -r id title year type library || [[ -n "$id" ]]; do
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
+        [[ "$type" == '1' || "$type" == '2' ]] || continue
+        CANDIDATE_IDS+=("$id")
+        CANDIDATE_TITLES+=("$title")
+        CANDIDATE_YEARS+=("$year")
+        CANDIDATE_TYPES+=("$type")
+        CANDIDATE_LIBRARIES+=("$library")
+    done <<< "$rows"
+
+    ((${#CANDIDATE_IDS[@]} > 0)) || die 'No movie or series titles were found in Plex.'
+}
+
+normalize_title() {
+    local value="$1"
+    value="$(printf '%s' "$value" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+    # Articles are optional only at the beginning, before whitespace/punctuation is ignored.
+    value="$(printf '%s' "$value" | LC_ALL=C sed -E 's/^[[:space:][:punct:]]*(the|an|a)[[:space:][:punct:]]+//')"
+    printf '%s' "$value" | LC_ALL=C sed 's/[^[:alnum:]]//g'
+}
+
+levenshtein_distance() {
+    local source="$1" target="$2"
+    local source_length=${#source} target_length=${#target}
+    local i j cost deletion insertion substitution minimum
+    local -a previous=() current=()
+
+    for ((j = 0; j <= target_length; j++)); do
+        previous[j]=$j
+    done
+
+    for ((i = 1; i <= source_length; i++)); do
+        current=()
+        current[0]=$i
+        for ((j = 1; j <= target_length; j++)); do
+            if [[ "${source:i-1:1}" == "${target:j-1:1}" ]]; then
+                cost=0
+            else
+                cost=1
+            fi
+            deletion=$((previous[j] + 1))
+            insertion=$((current[j-1] + 1))
+            substitution=$((previous[j-1] + cost))
+            minimum=$deletion
+            ((insertion < minimum)) && minimum=$insertion
+            ((substitution < minimum)) && minimum=$substitution
+            current[j]=$minimum
+        done
+        previous=("${current[@]}")
+    done
+    printf '%s\n' "${previous[target_length]}"
+}
+
+rank_matches() {
+    local query="$1" normalized_query normalized_title distance longest score index
+    local -a sortable=()
+
+    normalized_query="$(normalize_title "$query")"
+    [[ -n "$normalized_query" ]] || return 1
+
+    for index in "${!CANDIDATE_IDS[@]}"; do
+        normalized_title="$(normalize_title "${CANDIDATE_TITLES[index]}")"
+        [[ -n "$normalized_title" ]] || continue
+        distance="$(levenshtein_distance "$normalized_query" "$normalized_title")"
+        longest=${#normalized_query}
+        if ((${#normalized_title} > longest)); then
+            longest=${#normalized_title}
+        fi
+        score=$((distance * 100 / longest))
+        sortable+=("$(printf '%03d:%08d' "$score" "$index")")
+    done
+
+    RANKED_MATCHES=()
+    while IFS=: read -r score index; do
+        RANKED_MATCHES+=("$((10#$score)):$((10#$index))")
+    done < <(printf '%s\n' "${sortable[@]}" | LC_ALL=C sort)
+    ((${#RANKED_MATCHES[@]} > 0))
+}
+
+match_score() {
+    printf '%s' "${1%%:*}"
+}
+
+match_index() {
+    printf '%s' "${1#*:}"
+}
+
+show_matches() {
+    local maximum="${1:-5}" position match index title kind library
+    printf '\nMatches:\n'
+    for ((position = 0; position < ${#RANKED_MATCHES[@]} && position < maximum; position++)); do
+        match="${RANKED_MATCHES[position]}"
+        index="$(match_index "$match")"
+        title="$(display_title "${CANDIDATE_TITLES[index]}" "${CANDIDATE_YEARS[index]}")"
+        kind="$(item_kind "${CANDIDATE_TYPES[index]}")"
+        library="${CANDIDATE_LIBRARIES[index]}"
+        if [[ -n "$library" ]]; then
+            printf '  %d. %-44s %s  [%s]\n' "$((position + 1))" "$title" "$kind" "$library"
+        else
+            printf '  %d. %-44s %s\n' "$((position + 1))" "$title" "$kind"
+        fi
+    done
+}
+
+queue_contains() {
+    local wanted_id="$1" id
+    for id in "${QUEUE_IDS[@]}"; do
+        [[ "$id" == "$wanted_id" ]] && return 0
+    done
+    return 1
+}
+
+queue_add() {
+    local index="$1" id
+    id="${CANDIDATE_IDS[index]}"
+    if queue_contains "$id"; then
+        warn "$(display_title "${CANDIDATE_TITLES[index]}" "${CANDIDATE_YEARS[index]}") is already in the queue."
+        return 1
+    fi
+    QUEUE_IDS+=("$id")
+    QUEUE_TITLES+=("${CANDIDATE_TITLES[index]}")
+    QUEUE_YEARS+=("${CANDIDATE_YEARS[index]}")
+    QUEUE_TYPES+=("${CANDIDATE_TYPES[index]}")
+    QUEUE_LIBRARIES+=("${CANDIDATE_LIBRARIES[index]}")
+}
+
+show_queue() {
+    local index title kind
+    if ((${#QUEUE_IDS[@]} == 0)); then
+        printf '\nQueue is empty.\n'
+        return
+    fi
+    printf '\nQueue:\n'
+    for index in "${!QUEUE_IDS[@]}"; do
+        title="$(display_title "${QUEUE_TITLES[index]}" "${QUEUE_YEARS[index]}")"
+        kind="$(item_kind "${QUEUE_TYPES[index]}")"
+        printf '  %d. %-44s %s\n' "$((index + 1))" "$title" "$kind"
+    done
+}
+
+queue_remove() {
+    local position="$1" index title
+    [[ "$position" =~ ^[1-9][0-9]*$ ]] || {
+        warn 'remove expects a queue number, for example: remove 2'
+        return 1
+    }
+    index=$((position - 1))
+    if ((index >= ${#QUEUE_IDS[@]})); then
+        warn "There is no queue item $position."
+        return 1
+    fi
+    title="$(display_title "${QUEUE_TITLES[index]}" "${QUEUE_YEARS[index]}")"
+    unset 'QUEUE_IDS[index]' 'QUEUE_TITLES[index]' 'QUEUE_YEARS[index]' 'QUEUE_TYPES[index]' 'QUEUE_LIBRARIES[index]'
+    QUEUE_IDS=("${QUEUE_IDS[@]}")
+    QUEUE_TITLES=("${QUEUE_TITLES[@]}")
+    QUEUE_YEARS=("${QUEUE_YEARS[@]}")
+    QUEUE_TYPES=("${QUEUE_TYPES[@]}")
+    QUEUE_LIBRARIES=("${QUEUE_LIBRARIES[@]}")
+    printf 'Removed: %s\n' "$title"
+}
+
+select_ranked_match() {
+    local maximum="${1:-5}" choice selected_position match
+    if ((${#RANKED_MATCHES[@]} < maximum)); then
+        maximum=${#RANKED_MATCHES[@]}
+    fi
+    while true; do
+        read -r -p "Select [1-$maximum, Enter=1, q=cancel]: " choice || return 1
+        [[ -z "$choice" ]] && choice=1
+        [[ "$choice" == 'q' || "$choice" == 'Q' ]] && return 1
+        if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice <= maximum)); then
+            selected_position=$((choice - 1))
+            match="${RANKED_MATCHES[selected_position]}"
+            printf '%s' "$(match_index "$match")"
+            return 0
+        fi
+        warn "Please enter a number from 1 to $maximum, or q."
+    done
+}
+
+add_interactive_title() {
+    local query="$1" top_score selected_index
+    if ! rank_matches "$query"; then
+        warn 'Please enter at least one letter or number.'
+        return
+    fi
+    top_score="$(match_score "${RANKED_MATCHES[0]}")"
+    if ((top_score > 45)); then
+        printf 'No sufficiently close matches found. Please refine the title.\n'
+        return
+    fi
+    show_matches
+    if ! selected_index="$(select_ranked_match)"; then
+        printf 'Selection cancelled.\n'
+        return
+    fi
+    if queue_add "$selected_index"; then
+        printf '\nAdded:\n  %s [%s]\n' \
+            "$(display_title "${CANDIDATE_TITLES[selected_index]}" "${CANDIDATE_YEARS[selected_index]}")" \
+            "$(item_kind "${CANDIDATE_TYPES[selected_index]}")"
+    fi
+}
+
+add_expanded_id() {
+    local id="$1" existing
+    [[ "$id" =~ ^[0-9]+$ ]] || die "Database returned an invalid metadata ID: $id"
+    for existing in "${EXPANDED_IDS[@]}"; do
+        [[ "$existing" == "$id" ]] && return
+    done
+    EXPANDED_IDS+=("$id")
+}
+
+expand_queue() {
+    local queue_index id type rows row_id row_type seasons episodes expected_for_show
+    EXPANDED_IDS=()
+    SERIES_SEASON_COUNTS=()
+    SERIES_EPISODE_COUNTS=()
+
+    for queue_index in "${!QUEUE_IDS[@]}"; do
+        id="${QUEUE_IDS[queue_index]}"
+        type="${QUEUE_TYPES[queue_index]}"
+        [[ "$id" =~ ^[0-9]+$ ]] || die 'Queue contains an invalid metadata ID.'
+        case "$type" in
+            1) add_expanded_id "$id" ;;
+            2)
+                # Values in this query are IDs returned by Plex, never user-provided text.
+                rows="$(readonly_query "
+SELECT id, metadata_type
+  FROM metadata_items
+ WHERE (id = $id AND metadata_type = 2)
+    OR (metadata_type = 3 AND parent_id = $id)
+    OR (metadata_type = 4 AND parent_id IN
+        (SELECT id FROM metadata_items WHERE metadata_type = 3 AND parent_id = $id))
+ ORDER BY CASE metadata_type WHEN 2 THEN 0 WHEN 3 THEN 1 WHEN 4 THEN 2 END, id;")" \
+                    || die "Could not expand selected series ID $id. Plex remains running and no changes were made."
+                seasons=0
+                episodes=0
+                expected_for_show=0
+                while IFS="$FIELD_SEPARATOR" read -r row_id row_type || [[ -n "$row_id" ]]; do
+                    [[ "$row_id" =~ ^[0-9]+$ ]] || continue
+                    case "$row_type" in
+                        2) [[ "$row_id" == "$id" ]] || die "Series expansion escaped selected ID $id." ;;
+                        3) seasons=$((seasons + 1)) ;;
+                        4) episodes=$((episodes + 1)) ;;
+                        *) die "Unexpected metadata type returned while expanding series ID $id." ;;
+                    esac
+                    add_expanded_id "$row_id"
+                    expected_for_show=$((expected_for_show + 1))
+                done <<< "$rows"
+                ((expected_for_show > 0)) || die "Selected series ID $id no longer exists. Refresh and try again."
+                SERIES_SEASON_COUNTS["$id"]=$seasons
+                SERIES_EPISODE_COUNTS["$id"]=$episodes
+                ;;
+            *) die "Queue contains an unsupported metadata type: $type" ;;
+        esac
+    done
+    ((${#EXPANDED_IDS[@]} > 0)) || die 'No metadata records were selected.'
+}
+
+show_final_summary() {
+    local index id title
+    printf '\nReady to remove from Recently Added:\n\n'
+    if [[ " ${QUEUE_TYPES[*]} " == *' 1 '* ]]; then
+        printf '  Movies:\n'
+        for index in "${!QUEUE_IDS[@]}"; do
+            [[ "${QUEUE_TYPES[index]}" == '1' ]] || continue
+            printf '    %s\n' "$(display_title "${QUEUE_TITLES[index]}" "${QUEUE_YEARS[index]}")"
+        done
+        printf '\n'
+    fi
+    if [[ " ${QUEUE_TYPES[*]} " == *' 2 '* ]]; then
+        printf '  Series:\n'
+        for index in "${!QUEUE_IDS[@]}"; do
+            [[ "${QUEUE_TYPES[index]}" == '2' ]] || continue
+            id="${QUEUE_IDS[index]}"
+            title="$(display_title "${QUEUE_TITLES[index]}" "${QUEUE_YEARS[index]}")"
+            printf '    %s\n' "$title"
+            printf '      %s seasons / %s episodes\n' \
+                "${SERIES_SEASON_COUNTS[$id]}" "${SERIES_EPISODE_COUNTS[$id]}"
+        done
+        printf '\n'
+    fi
+    printf 'This will:\n'
+    printf '  • stop Plex once\n'
+    printf '  • create one database backup\n'
+    printf '  • update %d metadata records\n' "${#EXPANDED_IDS[@]}"
+    printf '  • restart Plex once\n'
+}
+
+confirm_write() {
+    local response
+    read -r -p 'Proceed? [y/N] ' response || return 1
+    [[ "$response" == 'y' || "$response" == 'Y' ]]
+}
+
+backup_database() {
+    local timestamp backup_path companion
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    backup_path="$DB_DIRECTORY/$DB_FILENAME.before-unrecent-$timestamp"
+    cp -p -- "$HOST_DB_PATH" "$backup_path" || die "Could not create database backup: $backup_path"
+    for companion in -wal -shm; do
+        if [[ -f "$HOST_DB_PATH$companion" ]]; then
+            cp -p -- "$HOST_DB_PATH$companion" "$backup_path$companion" \
+                || die "Could not preserve database companion backup: $backup_path$companion"
+        fi
+    done
+    printf '%s' "$backup_path"
+}
+
+write_selected_ids() {
+    local id_list sql output changed
+    id_list="$(IFS=,; printf '%s' "${EXPANDED_IDS[*]}")"
+    sql="BEGIN IMMEDIATE;
+UPDATE metadata_items
+   SET added_at = $BACKDATE_SQL
+ WHERE id IN ($id_list);
+SELECT changes();
+COMMIT;"
+
+    # Use the database owner inside the helper so it cannot leave root-owned SQLite files.
+    output="$(docker run --rm --user "$DB_OWNER" --volumes-from "$PLEX_CONTAINER" --entrypoint "$SQLITE_PATH" "$PLEX_IMAGE" \
+        -batch -noheader "$CONTAINER_DB_PATH" "$sql")" \
+        || return 1
+    changed="$(printf '%s\n' "$output" | awk '/^[0-9]+$/ { result = $0 } END { print result }')"
+    [[ "$changed" =~ ^[0-9]+$ ]] || {
+        warn 'The database update returned an unreadable changed-row count.'
+        return 1
+    }
+    [[ "$changed" -eq "${#EXPANDED_IDS[@]}" ]] || {
+        warn "Expected ${#EXPANDED_IDS[@]} changed rows, but Plex SQLite reported $changed."
+        return 1
+    }
+}
+
+restart_plex() {
+    RESTART_ATTEMPTED=1
+    if ! docker start "$PLEX_CONTAINER" >/dev/null; then
+        return 1
+    fi
+    PLEX_STOPPED=0
+    return 0
+}
+
+wait_for_identity() {
+    local deadline http_code
+    deadline=$((SECONDS + IDENTITY_TIMEOUT_SECONDS))
+    while ((SECONDS < deadline)); do
+        if http_code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --max-time 5 "$IDENTITY_URL" 2>/dev/null)" && [[ "$http_code" == '200' ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+prune_backups() {
+    local -a backups=() primary_backups=()
+    local backup index remove_count
+    shopt -s nullglob
+    # Match only the timestamp shape this utility creates, never Plex's own backups.
+    backups=("$DB_DIRECTORY/$DB_FILENAME.before-unrecent-"[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9])
+    shopt -u nullglob
+    for backup in "${backups[@]}"; do
+        [[ "$backup" == *-wal || "$backup" == *-shm ]] && continue
+        [[ -f "$backup" ]] && primary_backups+=("$backup")
+    done
+    ((${#primary_backups[@]} > BACKUP_RETENTION)) || return
+    mapfile -t primary_backups < <(printf '%s\n' "${primary_backups[@]}" | LC_ALL=C sort)
+    remove_count=$((${#primary_backups[@]} - BACKUP_RETENTION))
+    for ((index = 0; index < remove_count; index++)); do
+        backup="${primary_backups[index]}"
+        rm -f -- "$backup" "$backup-wal" "$backup-shm"
+    done
+}
+
+cleanup_after_exit() {
+    local exit_status=$?
+    trap - EXIT INT TERM
+    if ((PLEX_STOPPED)) && ((RESTART_ATTEMPTED == 0)); then
+        warn 'The script exited after Plex was stopped; attempting one restart.'
+        docker start "$PLEX_CONTAINER" >/dev/null || warn "Could not restart Plex container '$PLEX_CONTAINER'."
+    fi
+    exit "$exit_status"
+}
+
+confirm_target_container() {
+    local current_id current_state
+    current_id="$(docker inspect --format '{{.Id}}' "$PLEX_CONTAINER" 2>/dev/null)" \
+        || die "Cannot re-inspect Plex container '$PLEX_CONTAINER'."
+    current_state="$(docker inspect --format '{{.State.Running}}' "$PLEX_CONTAINER" 2>/dev/null)" \
+        || die "Cannot re-check Plex container '$PLEX_CONTAINER'."
+    [[ "$current_id" == "$PLEX_CONTAINER_ID" ]] \
+        || die 'Plex container changed while titles were being selected; no changes were made.'
+    [[ "$current_state" == 'true' ]] \
+        || die 'Plex stopped while titles were being selected; no changes were made.'
+}
+
+apply_changes() {
+    local backup_path
+    confirm_target_container
+    trap cleanup_after_exit EXIT INT TERM
+    printf '\nStopping Plex...\n'
+    docker stop "$PLEX_CONTAINER" >/dev/null || die "Could not stop Plex container '$PLEX_CONTAINER'."
+    PLEX_STOPPED=1
+
+    backup_path="$(backup_database)"
+    printf 'Backup created: %s\n' "$backup_path"
+
+    printf 'Updating %d selected metadata records...\n' "${#EXPANDED_IDS[@]}"
+    if ! write_selected_ids; then
+        warn "Database update failed. Backup retained at: $backup_path"
+        if ! restart_plex; then
+            warn "Could not restart Plex container '$PLEX_CONTAINER'."
+        fi
+        die 'No automatic restore was attempted.'
+    fi
+
+    printf 'Restarting Plex...\n'
+    if ! restart_plex; then
+        die "Database update succeeded, but Plex could not be restarted. Backup retained at: $backup_path"
+    fi
+    if ! wait_for_identity; then
+        warn "Plex restarted but $IDENTITY_URL did not return HTTP 200 within ${IDENTITY_TIMEOUT_SECONDS} seconds."
+        warn "Check: docker logs --tail 200 $PLEX_CONTAINER"
+        warn "Check: curl -i $IDENTITY_URL"
+        warn "Backup retained at: $backup_path"
+        return 1
+    fi
+
+    prune_backups
+    printf '\nSuccess: updated %d metadata records.\n' "${#EXPANDED_IDS[@]}"
+    printf 'If an item still appears in Plex Desktop\047s Recently Added row, fully quit the Plex app and reopen it; the client may cache the hub.\n'
+}
+
+run_single() {
+    local title="$1" top_score next_score selected_index
+    rank_matches "$title" || die 'Please provide a title containing at least one letter or number.'
+    top_score="$(match_score "${RANKED_MATCHES[0]}")"
+    if ((top_score > 35)); then
+        show_matches
+        die 'No high-confidence match was found. Use interactive mode to refine the title.'
+    fi
+    if ((${#RANKED_MATCHES[@]} > 1)); then
+        next_score="$(match_score "${RANKED_MATCHES[1]}")"
+        if ((next_score - top_score < 5)); then
+            show_matches
+            die 'The best matches are too close to choose safely. Use interactive batch mode to select one.'
+        fi
+    fi
+    show_matches
+    selected_index="$(match_index "${RANKED_MATCHES[0]}")"
+    QUEUE_IDS=("${CANDIDATE_IDS[selected_index]}")
+    QUEUE_TITLES=("${CANDIDATE_TITLES[selected_index]}")
+    QUEUE_YEARS=("${CANDIDATE_YEARS[selected_index]}")
+    QUEUE_TYPES=("${CANDIDATE_TYPES[selected_index]}")
+    QUEUE_LIBRARIES=("${CANDIDATE_LIBRARIES[selected_index]}")
+    expand_queue
+    show_final_summary
+    if ! confirm_write; then
+        printf 'No changes made.\n'
+        return
+    fi
+    apply_changes
+}
+
+run_interactive() {
+    local input
+    printf '\nEnter a movie/series title, or:\n'
+    printf '  list          Show queue\n'
+    printf '  remove N      Remove item N from queue\n'
+    printf '  done          Apply changes\n'
+    printf '  quit          Exit without changes\n\n'
+
+    while true; do
+        read -r -p 'add> ' input || {
+            printf '\nNo changes made.\n'
+            return
+        }
+        if [[ "$input" =~ ^remove[[:space:]]+(.+)$ ]]; then
+            queue_remove "${BASH_REMATCH[1]}"
+            continue
+        fi
+        case "$input" in
+            quit|q)
+                printf 'No changes made.\n'
+                return
+                ;;
+            list)
+                show_queue
+                ;;
+            done)
+                if ((${#QUEUE_IDS[@]} == 0)); then
+                    warn 'The queue is empty.'
+                    continue
+                fi
+                expand_queue
+                show_final_summary
+                if ! confirm_write; then
+                    printf 'No changes made; returning to the queue.\n'
+                    continue
+                fi
+                apply_changes
+                return
+                ;;
+            '') ;;
+            *) add_interactive_title "$input" ;;
+        esac
+    done
+}
+
+main() {
+    case "${1:-}" in
+        -h|--help)
+            usage
+            return
+            ;;
+    esac
+    validate_configuration
+    if (($# == 0)); then
+        printf 'Plex container: %s\n' "$PLEX_CONTAINER"
+        printf 'Reading movie and series titles...\n'
+        load_candidates
+        run_interactive
+    else
+        load_candidates
+        run_single "$*"
+    fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
