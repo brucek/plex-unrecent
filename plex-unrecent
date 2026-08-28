@@ -203,28 +203,62 @@ levenshtein_distance() {
 }
 
 rank_matches() {
-    local query="$1" normalized_query normalized_title distance longest score index
-    local -a sortable=()
+    local query="$1" ranked_rows score index candidate_index
 
-    normalized_query="$(normalize_title "$query")"
-    [[ -n "$normalized_query" ]] || return 1
-
-    for index in "${!CANDIDATE_IDS[@]}"; do
-        normalized_title="$(normalize_title "${CANDIDATE_TITLES[index]}")"
-        [[ -n "$normalized_title" ]] || continue
-        distance="$(levenshtein_distance "$normalized_query" "$normalized_title")"
-        longest=${#normalized_query}
-        if ((${#normalized_title} > longest)); then
-            longest=${#normalized_title}
-        fi
-        score=$((distance * 100 / longest))
-        sortable+=("$(printf '%03d:%08d' "$score" "$index")")
-    done
+    # Keep matching in one awk process. Running normalization and a Bash dynamic
+    # programming loop once per Plex title is prohibitively slow for large libraries.
+    if ! ranked_rows="$({
+        for candidate_index in "${!CANDIDATE_IDS[@]}"; do
+            printf '%s%s%s\n' "$candidate_index" "$FIELD_SEPARATOR" "${CANDIDATE_TITLES[candidate_index]}"
+        done
+    } | awk -F "$FIELD_SEPARATOR" -v query="$query" '
+function normalize(value) {
+    value = tolower(value)
+    sub(/^[[:space:][:punct:]]*(the|an|a)[[:space:][:punct:]]+/, "", value)
+    gsub(/[^[:alnum:]]/, "", value)
+    return value
+}
+function levenshtein(source, target,    source_length,target_length,i,j,cost,deletion,insertion,substitution,minimum,previous,current) {
+    source_length = length(source)
+    target_length = length(target)
+    for (j = 0; j <= target_length; j++) previous[j] = j
+    for (i = 1; i <= source_length; i++) {
+        current[0] = i
+        for (j = 1; j <= target_length; j++) {
+            cost = (substr(source, i, 1) == substr(target, j, 1)) ? 0 : 1
+            deletion = previous[j] + 1
+            insertion = current[j - 1] + 1
+            substitution = previous[j - 1] + cost
+            minimum = deletion
+            if (insertion < minimum) minimum = insertion
+            if (substitution < minimum) minimum = substitution
+            current[j] = minimum
+        }
+        for (j = 0; j <= target_length; j++) previous[j] = current[j]
+    }
+    return previous[target_length]
+}
+BEGIN {
+    normalized_query = normalize(query)
+    if (normalized_query == "") exit 2
+}
+{
+    normalized_title = normalize($2)
+    if (normalized_title == "") next
+    longest = length(normalized_query)
+    if (length(normalized_title) > longest) longest = length(normalized_title)
+    score = int(levenshtein(normalized_query, normalized_title) * 100 / longest)
+    printf "%03d:%08d\n", score, $1
+}
+' | LC_ALL=C sort)"; then
+        return 1
+    fi
 
     RANKED_MATCHES=()
     while IFS=: read -r score index; do
+        [[ -n "$score" && -n "$index" ]] || continue
         RANKED_MATCHES+=("$((10#$score)):$((10#$index))")
-    done < <(printf '%s\n' "${sortable[@]}" | LC_ALL=C sort)
+    done <<< "$ranked_rows"
     ((${#RANKED_MATCHES[@]} > 0))
 }
 

@@ -36,3 +36,9 @@ Deployment verified on the Unraid host on 2026-08-27. Both deployed copies match
 SHA-256 `2512f419fff3519eb0f62b9ebe4b24af223ea392a1afb058b959f8bc67bda759`.
 The previous persistent copy is retained at
 `/boot/config/custom/bin/plex-unrecent.before-update-20260827-221813`.
+
+## Live performance fix
+
+- [ ] Inspect the hung interactive matcher on the Unraid host and confirm the bottleneck.
+- [ ] Replace the unbounded matcher with a bounded, deterministic approach.
+- [ ] Test the fix offline and on the Unraid host without changing Plex data.
