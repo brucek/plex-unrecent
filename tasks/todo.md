@@ -50,6 +50,10 @@ candidate query), with exit status 0.
 ## Plex readiness checker
 
 - [x] Rename the command to `ready-plex` for convenient tab completion.
-- [ ] Add a standalone readiness checker with clear status and exit codes.
-- [ ] Add offline response-classification tests and usage documentation.
-- [ ] Test and install the checker on the Unraid host's persistent and active paths.
+- [x] Add a standalone readiness checker with clear status and exit codes.
+- [x] Add offline response-classification tests and usage documentation.
+- [x] Test and install the checker on the Unraid host's persistent and active paths.
+
+`ready-plex --timeout 15` completed successfully on the Unraid host against Plex's
+live HTTP 200 `MediaContainer` identity response. Persistent and active copies
+match SHA-256 `521f37fdd24d121b005c62a698df86c4951414d31a1ccdb0b00f4af4a13f9f71`.
