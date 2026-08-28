@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# plex-ready - wait for Plex's local identity endpoint to report ready.
+
+set -euo pipefail
+
+readonly DEFAULT_CONTAINER="plex"
+readonly IDENTITY_URL="http://127.0.0.1:32400/identity"
+readonly DEFAULT_TIMEOUT_SECONDS=60
+readonly DEFAULT_INTERVAL_SECONDS=2
+
+PLEX_CONTAINER="${PLEX_READY_CONTAINER:-$DEFAULT_CONTAINER}"
+TIMEOUT_SECONDS="${PLEX_READY_TIMEOUT:-$DEFAULT_TIMEOUT_SECONDS}"
+INTERVAL_SECONDS="$DEFAULT_INTERVAL_SECONDS"
+RESPONSE_FILE=""
+
+usage() {
+    cat <<'EOF'
+Usage: plex-ready [--timeout SECONDS] [--interval SECONDS]
+
+Wait for the local Plex identity endpoint to return a healthy MediaContainer.
+
+Environment:
+  PLEX_READY_CONTAINER  Plex container name (default: plex)
+  PLEX_READY_TIMEOUT    Maximum wait in seconds (default: 60)
+
+Exit status:
+  0  Plex is ready
+  1  Plex did not become ready before the timeout
+  2  Invalid invocation or missing required host command
+EOF
+}
+
+die_usage() {
+    printf 'Error: %s\n' "$*" >&2
+    usage >&2
+    exit 2
+}
+
+cleanup() {
+    [[ -n "$RESPONSE_FILE" ]] && rm -f -- "$RESPONSE_FILE"
+}
+
+validate_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+response_is_ready() {
+    local http_code="$1" response_file="$2"
+    [[ "$http_code" == '200' ]] || return 1
+    grep -Eq '<MediaContainer([[:space:]>])' "$response_file" || return 1
+    ! grep -Eqi 'running database migrations|maintenance|<Response([[:space:]>])|error' "$response_file"
+}
+
+response_status() {
+    local http_code="$1" response_file="$2" detail
+    if [[ -s "$response_file" ]]; then
+        detail="$(tr '\n\r' '  ' < "$response_file" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//; s/^(.{180}).*/\1/')"
+        printf 'HTTP %s: %s' "$http_code" "$detail"
+    else
+        printf 'HTTP %s with no response body' "$http_code"
+    fi
+}
+
+container_is_running() {
+    [[ "$(docker inspect --format '{{.State.Running}}' "$PLEX_CONTAINER" 2>/dev/null)" == 'true' ]]
+}
+
+main() {
+    local argument http_code last_status='' current_status deadline
+    while (($# > 0)); do
+        argument="$1"
+        case "$argument" in
+            -h|--help)
+                usage
+                return
+                ;;
+            --timeout)
+                (($# >= 2)) || die_usage '--timeout requires a positive integer.'
+                TIMEOUT_SECONDS="$2"
+                shift 2
+                ;;
+            --interval)
+                (($# >= 2)) || die_usage '--interval requires a positive integer.'
+                INTERVAL_SECONDS="$2"
+                shift 2
+                ;;
+            *) die_usage "Unknown argument: $argument" ;;
+        esac
+    done
+
+    validate_positive_integer "$TIMEOUT_SECONDS" || die_usage 'Timeout must be a positive integer.'
+    validate_positive_integer "$INTERVAL_SECONDS" || die_usage 'Interval must be a positive integer.'
+    command -v docker >/dev/null 2>&1 || die_usage 'docker is required on the Unraid host.'
+    command -v curl >/dev/null 2>&1 || die_usage 'curl is required to contact Plex.'
+
+    RESPONSE_FILE="$(mktemp)" || die_usage 'Could not create a temporary response file.'
+    trap cleanup EXIT INT TERM
+    deadline=$((SECONDS + TIMEOUT_SECONDS))
+    printf 'Checking Plex container %q for up to %s seconds...\n' "$PLEX_CONTAINER" "$TIMEOUT_SECONDS"
+
+    while ((SECONDS < deadline)); do
+        if ! container_is_running; then
+            current_status="container is not running"
+        else
+            : > "$RESPONSE_FILE"
+            if http_code="$(curl --silent --show-error --output "$RESPONSE_FILE" --write-out '%{http_code}' \
+                --max-time 5 "$IDENTITY_URL" 2>/dev/null)"; then
+                if response_is_ready "$http_code" "$RESPONSE_FILE"; then
+                    printf 'Plex is ready: HTTP 200 identity response is healthy.\n'
+                    return 0
+                fi
+                current_status="$(response_status "$http_code" "$RESPONSE_FILE")"
+            else
+                current_status='identity endpoint is not reachable yet'
+            fi
+        fi
+        if [[ "$current_status" != "$last_status" ]]; then
+            printf 'Not ready: %s\n' "$current_status"
+            last_status="$current_status"
+        fi
+        sleep "$INTERVAL_SECONDS"
+    done
+
+    printf 'Plex did not become ready within %s seconds.\n' "$TIMEOUT_SECONDS" >&2
+    printf 'Check: docker logs --tail 200 %s\n' "$PLEX_CONTAINER" >&2
+    printf 'Check: curl -i %s\n' "$IDENTITY_URL" >&2
+    return 1
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

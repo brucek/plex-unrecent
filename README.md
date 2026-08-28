@@ -116,6 +116,32 @@ During startup, a temporary HTTP 503 with a database-migration message can be no
 
 If the item still appears in Plex Desktop's Recently Added row, fully quit the Plex app and reopen it; the client may cache the hub. That client-side cache does not by itself mean the database update failed.
 
+## Check Plex readiness
+
+`plex-ready` is a companion command that waits for Plex to become usable after
+a restart or any other maintenance:
+
+```bash
+plex-ready
+plex-ready --timeout 120
+PLEX_READY_CONTAINER=plex plex-ready --interval 3
+```
+
+It checks that the configured Docker container is running and calls
+`http://127.0.0.1:32400/identity`. It exits successfully only for an HTTP 200
+response containing Plex's healthy `MediaContainer` identity response. A 503
+maintenance response, the "running database migrations" response, malformed
+responses, an error response, or a closed port are all reported as **not
+ready**. The command exits `0` when Plex is ready, `1` after its timeout, and
+`2` for invalid options or missing dependencies.
+
+Install it using the same persistent-Unraid pattern as `plex-unrecent`:
+
+```bash
+cp plex-ready /boot/config/custom/bin/plex-ready
+chmod 755 /boot/config/custom/bin/plex-ready
+```
+
 ## Troubleshooting
 
 ```bash
@@ -153,5 +179,7 @@ The offline harness uses mocked database reads and a temporary directory; it nev
 ```bash
 bash -n plex-unrecent
 bash tests/test_plex_unrecent.sh
+./plex-ready --help
+bash tests/test_plex_ready.sh
 shellcheck plex-unrecent   # when installed
 ```

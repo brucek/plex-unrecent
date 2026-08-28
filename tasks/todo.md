@@ -46,3 +46,9 @@ The previous persistent copy is retained at
 Confirmed the full candidate list on the Unraid host. The live `bogus` interactive
 read-only path completed and cancelled normally in 4 seconds (including the
 candidate query), with exit status 0.
+
+## Plex readiness checker
+
+- [ ] Add a standalone readiness checker with clear status and exit codes.
+- [ ] Add offline response-classification tests and usage documentation.
+- [ ] Test and install the checker on the Unraid host's persistent and active paths.
