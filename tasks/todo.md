@@ -25,3 +25,14 @@
   a host SQLite dependency and root-owned database side files.
 - Offline checks cover normalization, fuzzy selection, duplicate prevention,
   series descendants, and timestamped backup retention.
+
+## Unraid deployment
+
+- [x] Confirm SSH connectivity and inspect persistent/active script copies.
+- [x] Install the committed executable to persistent flash and refresh the active copy.
+- [x] Verify checksums, permissions, and shell syntax on the Unraid host.
+
+Deployment verified on the Unraid host on 2026-08-27. Both deployed copies match
+SHA-256 `2512f419fff3519eb0f62b9ebe4b24af223ea392a1afb058b959f8bc67bda759`.
+The previous persistent copy is retained at
+`/boot/config/custom/bin/plex-unrecent.before-update-20260827-221813`.
